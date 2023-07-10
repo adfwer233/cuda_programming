@@ -1,5 +1,18 @@
 #include<stdio.h>
 
+void genRandomMatrix(float *A, int M, int N)
+{
+    srand(time(NULL)); // Initialization, should only be called once.
+    float a = 5.0;
+    for (int i = 0; i < M; i++)
+    {
+        for (int j = 0; j < N; j++)
+        {
+            A[i * N + j] = (float)rand() / ((float)RAND_MAX / a);
+        }
+    }
+}
+
 void initMatrix(float *A, int size) {
     for (int i = 0; i < size; i++) {
         A[i] = 1.0;
@@ -19,44 +32,33 @@ __global__ void matmul(const float *A, const float *B, float *C, int M, int N, i
     }
 }
 
-constexpr int M_block = 128;
-constexpr int N_block = 128;
-constexpr int K_block = 8;
-constexpr int M_thread = 8;
-constexpr int N_thread = 8;
+constexpr int K_block = 16;
 
 __global__ void matmul_tile(const float *A, const float *B, float *C, int M, int N, int K, float alpha, float beta) {
-    int tx = blockDim.x * blockIdx.x * M_block + M_thread * threadIdx.x;
-    int ty = blockDim.y * blockIdx.y * N_block + N_thread * threadIdx.y;
+    __shared__ int tile_A[K_block][K_block];
+    __shared__ int tile_B[K_block][K_block];
 
-    // for (int i = 0; i < M_thread; i++) {
-    //     for (int j = 0; j < N_thread; j++) {
-    //         int c = 0;
-    //         for (int k = 0; k < K; k++) {
-    //             c += A[(tx + i) * M + k] * B[k * K + ty + j];
-    //         }
-    //         C[(tx + i) * M + ty + j] = alpha * c + beta * C[(tx + i) * M + ty + j];
-    //     }
-    // }
+    float c = 0;
 
-    float c[M_thread * N_thread] = {};
+    for (int t = 0; t < K; t += K_block) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        int j = t + threadIdx.y;
 
-    for (int block = 0; block < K; block += K_block) {
-        #pragma unroll
-        for (int k = 0; k < K_block; k++) {
-            for (int i = 0 ; i < M_thread; i++) {
-                for (int j = 0; j < N_thread; j++) {
-                    c[i * M_thread + j] += A[(tx + i) * M + block + k] * B[(block + k) * K + ty + j];
-                }
-            }
-        }
+        tile_A[threadIdx.x][threadIdx.y] = A[i * M + j];
+        tile_B[threadIdx.y][threadIdx.x] = B[j * K + i];
+
+        __syncthreads();
+
+        for (int k = 0; k < K_block; k++)
+            // c += 1;
+            c += tile_A[threadIdx.x][k] * tile_B[k][threadIdx.y];
+    
+        __syncthreads();
     }
 
-    for (int i = 0; i < M_thread; i++) {
-        for (int j = 0; j < N_thread; j++) {
-            C[(tx + i) * M + ty + j] = alpha * c[i * M_thread + j] + beta * C[(tx + i) * M + ty + j];
-        }
-    }
+    int tx = blockDim.x * blockIdx.x + threadIdx.x;
+    int ty = blockDim.y * blockIdx.y + threadIdx.y;
+    C[tx * M + ty] = c;
 }
 
 int main() {
@@ -90,10 +92,10 @@ int main() {
     // dim3 block(thread_num, thread_num);
     // matmul<<<grid, block>>>(dev_A, dev_B, dev_C, M, N, K, 1, 0);
 
-    const int thread_num = M_block / M_thread;
+    const int thread_num = 16;
     dim3 grid(M / thread_num, N / thread_num);
     dim3 block(thread_num, thread_num);
-    matmul<<<grid, block>>>(dev_A, dev_B, dev_C, M, N, K, 1, 0);
+    matmul_tile<<<grid, block>>>(dev_A, dev_B, dev_C, M, N, K, 1, 0);
 
     cudaDeviceSynchronize();
     long kernel_call_end_clock = clock();
@@ -107,6 +109,9 @@ int main() {
     float delta = 0;
     for (int i = 0; i < M * N; i++) {
         delta = max(delta, abs(C[i] - 8192));
+        if (abs(C[i] - 8192) > 0.5) {
+            printf("error at %d %d \n", i / N, i % N);
+        }
     }
     
     printf("max delta %f \n", delta);
