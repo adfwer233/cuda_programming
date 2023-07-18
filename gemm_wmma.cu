@@ -91,48 +91,54 @@ __global__ void matmul_tensor_core_v2(half *A, half *B, float *C, int M, int N, 
     int tid = threadIdx.x;
     int wid = tid >> 5;     // 32 thread per block; wrap id = thread id / 32, 0 \leq wid \leq 8
 
-    __shared__ half shared_A[M_tile][K_tile];
-    __shared__ half shared_B[K_tile][N_tile];
+    constexpr int PAD = 8;
+
+    __shared__ half shared_A[M_tile][K_tile + PAD];
+    __shared__ half shared_B[K_tile][N_tile + PAD];
 
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fragment_matrix_A[M_wrap_tile / tensor_core_fragment_size][K_tile / tensor_core_fragment_size];
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> fragment_matrix_B[K_tile / tensor_core_fragment_size][M_wrap_tile / tensor_core_fragment_size];
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> fragment_accumulator[M_tile / tensor_core_fragment_size][N_tile / tensor_core_fragment_size];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> fragment_accumulator[M_wrap_tile / tensor_core_fragment_size][N_wrap_tile / tensor_core_fragment_size];
 
-    for (int i = 0; i < M_tile / tensor_core_fragment_size; i++) 
-        for (int j = 0; j < N_tile / tensor_core_fragment_size; j++)
+    for (int i = 0; i < M_wrap_tile / tensor_core_fragment_size; i++) 
+        for (int j = 0; j < N_wrap_tile / tensor_core_fragment_size; j++)
             wmma::fill_fragment(fragment_accumulator[i][j], 0.0);
 
     // a thread read 2 * 8 from A to shared, 
     int load_A_shared_m = (tid >> 2) << 1;
-    int load_A_shared_n = (tid & 3) << 3; 
+    int load_A_shared_k = (tid & 3) << 3; 
     
     // a thread read 4 * 8 from B to shared, 256 / 8 = 32
-    int load_B_shared_m = (tid >> 5) << 2;
+    int load_B_shared_k = (tid >> 5) << 2;
     int load_B_shared_n = (tid & 31) << 3;
 
-    int load_a_global_addr = load_A_shared_m * K + load_A_shared_n;
-    int load_b_global_addr = load_B_shared_m * N + load_B_shared_n;
+    int load_A_global_m = by * M_tile + load_A_shared_m;
+    int load_B_global_n = bx * N_tile + load_B_shared_n;
 
-    int comp_c_frag_m = wid / 4;
-    int comp_c_frag_n = wid % 4;
+    int load_a_global_addr = load_A_global_m * K + load_A_shared_k;
+    int load_b_global_addr = load_B_shared_k * N + load_B_global_n;
+
+    int comp_c_frag_m = wid & 1;
+    int comp_c_frag_n = wid >> 1;
 
     for (int k = 0; k < K; k += K_tile) {
-        FLOAT4(shared_A[load_A_shared_m    ][load_A_shared_n]) = FLOAT4(A[load_a_global_addr        ]);
-        FLOAT4(shared_A[load_A_shared_m + 1][load_A_shared_n]) = FLOAT4(A[load_a_global_addr +     K]);
-        FLOAT4(shared_B[load_B_shared_m    ][load_B_shared_n]) = FLOAT4(B[load_b_global_addr        ]);
-        FLOAT4(shared_B[load_B_shared_m + 1][load_B_shared_n]) = FLOAT4(B[load_b_global_addr +     N]);
-        FLOAT4(shared_B[load_B_shared_m + 2][load_B_shared_n]) = FLOAT4(B[load_b_global_addr + 2 * N]);
-        FLOAT4(shared_B[load_B_shared_m + 3][load_B_shared_n]) = FLOAT4(B[load_b_global_addr + 3 * N]);
+        FLOAT4(shared_A[load_A_shared_m    ][load_A_shared_k]) = FLOAT4(A[load_a_global_addr        ]);
+        FLOAT4(shared_A[load_A_shared_m + 1][load_A_shared_k]) = FLOAT4(A[load_a_global_addr +     K]);
+        FLOAT4(shared_B[load_B_shared_k    ][load_B_shared_n]) = FLOAT4(B[load_b_global_addr        ]);
+        FLOAT4(shared_B[load_B_shared_k + 1][load_B_shared_n]) = FLOAT4(B[load_b_global_addr +     N]);
+        FLOAT4(shared_B[load_B_shared_k + 2][load_B_shared_n]) = FLOAT4(B[load_b_global_addr + 2 * N]);
+        FLOAT4(shared_B[load_B_shared_k + 3][load_B_shared_n]) = FLOAT4(B[load_b_global_addr + 3 * N]);
 
         load_a_global_addr += K_tile;
         load_b_global_addr += K_tile * N;
+
         __syncthreads();
 
         #pragma unroll
         for (int i = 0; i < M_wrap_tile / tensor_core_fragment_size; i++) {
             #pragma unroll
             for (int kk = 0; kk < K_tile / tensor_core_fragment_size; kk++) {
-                wmma::load_matrix_sync(fragment_matrix_A[i][kk], &shared_A[i * tensor_core_fragment_size + comp_c_frag_m][kk * tensor_core_fragment_size], K_tile);
+                wmma::load_matrix_sync(fragment_matrix_A[i][kk], &shared_A[i * tensor_core_fragment_size + comp_c_frag_m * M_wrap_tile][kk * tensor_core_fragment_size], K_tile + PAD);
             }
         }
 
@@ -140,7 +146,7 @@ __global__ void matmul_tensor_core_v2(half *A, half *B, float *C, int M, int N, 
         for (int kk = 0; kk < K_tile / tensor_core_fragment_size; kk++) {
             #pragma unroll
             for (int j = 0; j < N_wrap_tile / tensor_core_fragment_size; j++) {
-                wmma::load_matrix_sync(fragment_matrix_B[kk][j], &shared_B[kk * tensor_core_fragment_size][comp_c_frag_n * N_wrap_tile + j * tensor_core_fragment_size], N_tile);
+                wmma::load_matrix_sync(fragment_matrix_B[kk][j], &shared_B[kk * tensor_core_fragment_size][comp_c_frag_n * N_wrap_tile + j * tensor_core_fragment_size], N_tile + PAD);
             }
         }
 
@@ -150,7 +156,7 @@ __global__ void matmul_tensor_core_v2(half *A, half *B, float *C, int M, int N, 
             for (int j = 0; j < N_wrap_tile / tensor_core_fragment_size; j++) {
                 #pragma unroll
                 for (int kk = 0; kk < K_tile / tensor_core_fragment_size; kk++) {
-                    wmma::mma_sync(fragment_accumulator[i][j], fragment_matrix_A[i][k], fragment_matrix_B[k][j], fragment_accumulator[i][j]);
+                    wmma::mma_sync(fragment_accumulator[i][j], fragment_matrix_A[i][kk], fragment_matrix_B[kk][j], fragment_accumulator[i][j]);
                 }
             }
         }
@@ -237,7 +243,7 @@ int main() {
     for (int i = 0; i < M * N; i++) {
         delta = max(delta, abs(C[i] - 8192));
         if (abs(C[i] - 8192) > 0.5) {
-            printf("error at %lld %lld \n", i / N, i % N);
+            printf("error at %lld %lld %f\n", i / N, i % N, C[i]);
             break;
         }
     }
